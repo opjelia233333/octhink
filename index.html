@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>绘画辅助 · 三维人物与透视</title>
+<style>
+:root{--cv:#f4f4f2;--bar:#fff;--fg:#222;--bd:#d0d0cc;color-scheme:light}
+@media(prefers-color-scheme:dark){:root{--cv:#1c1c1f;--bar:#26262a;--fg:#eee;--bd:#444;color-scheme:dark}}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{display:flex;flex-direction:column;background:var(--cv);color:var(--fg);font:14px/1.3 system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;padding:env(safe-area-inset-top,0) env(safe-area-inset-right,0) env(safe-area-inset-bottom,0) env(safe-area-inset-left,0)}
+#bar{background:var(--bar);border-bottom:1px solid var(--bd)}
+#bar summary{padding:8px 10px;cursor:pointer}
+#ctl{display:flex;flex-wrap:wrap;gap:8px 12px;align-items:center;padding:0 10px 8px}
+#ctl label{display:flex;align-items:center;gap:5px;white-space:nowrap}
+#ctl b{min-width:30px;font-weight:500}
+select,button{font:inherit;color:var(--fg);background:var(--cv);border:1px solid var(--bd);border-radius:6px;padding:5px 9px}
+button:active{background:var(--bd)}
+input[type=range]{width:84px}
+#c{flex:1;min-height:0;width:100%;display:block;touch-action:none}
+</style>
+</head>
+<body>
+<details id="bar"><summary>设置</summary><div id="ctl">
+  <label>预设<select id="pre"><option value="">自定义</option><option value="1">一点透视</option><option value="2" selected>两点透视</option><option value="3">三点透视</option></select></label>
+  <label>方位<input id="yaw" type="range" min="-90" max="90" value="35"><b id="o_yaw"></b></label>
+  <label>俯仰<input id="pit" type="range" min="-30" max="60" value="0"><b id="o_pit"></b></label>
+  <label>距离cm<input id="dist" type="range" min="200" max="1500" value="520"><b id="o_dist"></b></label>
+  <label>焦距mm<input id="foc" type="range" min="18" max="120" value="40"><b id="o_foc"></b></label>
+  <label>视点高cm<input id="ty" type="range" min="0" max="250" value="100"><b id="o_ty"></b></label>
+  <label>线数<input id="n" type="range" min="4" max="40" value="12"><b id="o_n"></b></label>
+  <label><input id="show" type="checkbox" checked>透视线</label>
+  <label><input id="grid" type="checkbox" checked>地面格(1m)</label>
+  <label><input id="top" type="checkbox" checked>顶视图</label>
+  <label>人数<select id="cnt"><option>1</option><option>2</option><option selected>3</option><option>4</option></select></label>
+  <label>身高cm<select id="hgt"><option>110</option><option>130</option><option>150</option><option>160</option><option>170</option><option>180</option><option>190</option></select></label>
+  <label>拖骨盆<select id="mv"><option value="g">沿地面</option><option value="v">上下</option></select></label>
+  <button id="flip">翻转前后</button>
+  <button id="reset">重置</button>
+  <button id="save">保存姿势</button>
+  <button id="load">读取姿势</button>
+  <button id="png">导出PNG</button>
+  <input id="file" type="file" accept=".json" hidden>
+</div></details>
+<canvas id="c"></canvas>
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const cv = $('c'), ctx = cv.getContext('2d');
+let W = 0, H = 0, figs = [], count = 3, sel = {f:0, k:'pelvis'}, drag = null, cam = {};
+
+/* ---------- 向量 ---------- */
+const add=(a,b)=>[a[0]+b[0],a[1]+b[1],a[2]+b[2]], sub=(a,b)=>[a[0]-b[0],a[1]-b[1],a[2]-b[2]],
+      mul=(a,s)=>[a[0]*s,a[1]*s,a[2]*s], dot=(a,b)=>a[0]*b[0]+a[1]*b[1]+a[2]*b[2],
+      cross=(a,b)=>[a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]],
+      len=a=>Math.hypot(a[0],a[1],a[2]), nrm=a=>mul(a,1/(len(a)||1));
+const rot=(v,k,a)=>{const c=Math.cos(a),s=Math.sin(a);return add(add(mul(v,c),mul(cross(k,v),s)),mul(k,dot(k,v)*(1-c)));};
+const rotGroup=(f,names,pv,k,a)=>{for(const n of names)f.p[n]=add(pv,rot(sub(f.p[n],pv),k,a));};
+function rotFrom(f,names,pv,a,b){const k=cross(a,b),s=len(k);if(s<1e-9)return;rotGroup(f,names,pv,mul(k,1/s),Math.atan2(s,dot(a,b)));}
+
+/* ---------- 骨架：按真实人体比例（以身高 h 为单位），骨长在创建时锁定 ---------- */
+const OFF={pelvis:[0,.53,0],neck:[0,.83,0],head:[0,.935,0],
+  shL:[-.125,.81,0],elL:[-.135,.624,0],haL:[-.145,.478,0],
+  shR:[.125,.81,0],elR:[.135,.624,0],haR:[.145,.478,0],
+  hpL:[-.09,.53,0],knL:[-.09,.285,0],ftL:[-.09,.039,0],
+  hpR:[.09,.53,0],knR:[.09,.285,0],ftR:[.09,.039,0]};
+const NAMES=Object.keys(OFF);
+const PARENT={neck:'pelvis',head:'neck',shL:'neck',elL:'shL',haL:'elL',shR:'neck',elR:'shR',haR:'elR',
+  hpL:'pelvis',knL:'hpL',ftL:'knL',hpR:'pelvis',knR:'hpR',ftR:'knR'};
+const BONES=Object.entries(PARENT).map(([k,p])=>[p,k]);
+const BW={neck:.09,head:.03,shL:.03,shR:.03,elL:.035,elR:.035,haL:.028,haR:.028,hpL:.04,hpR:.04,knL:.06,knR:.06,ftL:.045,ftR:.045};
+const CH={};for(const k in PARENT)(CH[PARENT[k]]=CH[PARENT[k]]||[]).push(k);
+const kids=k=>[k].concat((CH[k]||[]).flatMap(kids));
+const UPPER=kids('neck'), LEGS=[...kids('hpL'),...kids('hpR')];
+const LIMB=new Set(['head','elL','haL','elR','haR','knL','ftL','knR','ftR']);
+const COLORS=['#e5484d','#3e63dd','#30a46c','#f5a524'];
+
+function makeFig(x,z,h,ry,color){
+  const p={},c=Math.cos(ry),s=Math.sin(ry);
+  for(const k in OFF){const [ox,oy,oz]=OFF[k];p[k]=[x+(ox*c+oz*s)*h,oy*h,z+(-ox*s+oz*c)*h];}
+  const l={};for(const k in PARENT)l[k]=len(sub(p[k],p[PARENT[k]]));
+  return {h,p,len:l,color};
+}
+function initFigs(){
+  const S=[[-120,-60,170,.4],[20,0,160,-.2],[130,90,180,-.5],[-40,170,150,.1]];
+  figs=S.map((s,i)=>makeFig(s[0],s[1],s[2],s[3],COLORS[i]));
+}
+
+/* ---------- 相机：绕目标点环绕，真实透视投影 ---------- */
+function setCam(){
+  const g=id=>+$(id).value, r=Math.PI/180, ps=g('yaw')*r, pt=g('pit')*r, R=g('dist');
+  const T=[0,g('ty'),0];
+  const E=add(T,[R*Math.sin(ps)*Math.cos(pt),R*Math.sin(pt),R*Math.cos(ps)*Math.cos(pt)]);
+  const fw=nrm(sub(T,E)), rt=nrm(cross(fw,[0,1,0])), up=cross(rt,fw);
+  cam={E,fw,rt,up,f:g('foc')/36*W,cx:W/2,cy:H/2};
+}
+const toCam=v=>{const d=sub(v,cam.E);return [dot(d,cam.rt),dot(d,cam.up),dot(d,cam.fw)];};
+const proj=v=>{const c=toCam(v);return {x:cam.cx+cam.f*c[0]/c[2],y:cam.cy-cam.f*c[1]/c[2],z:c[2]};};
+const ray=(x,y)=>nrm(add(add(mul(cam.rt,(x-cam.cx)/cam.f),mul(cam.up,-(y-cam.cy)/cam.f)),cam.fw));
+
+/* 射线与以 c 为球心、r 为半径的球相交；取离 ref 最近（far=true 取另一个）的交点；无交点则取最近点 */
+function sphereHit(d,c,r,ref,far){
+  const o=cam.E,oc=sub(o,c),b=dot(oc,d),disc=b*b-(dot(oc,oc)-r*r);
+  if(disc>=0){
+    const s=Math.sqrt(disc),ps=[-b-s,-b+s].filter(t=>t>0).map(t=>add(o,mul(d,t)));
+    if(ps.length){ps.sort((p,q)=>len(sub(p,ref))-len(sub(q,ref)));return far?ps[ps.length-1]:ps[0];}
+  }
+  const q=add(o,mul(d,Math.max(-b,1)));
+  return add(c,mul(nrm(sub(q,c)),r));
+}
+function planeT(d,pt){
+  const n=$('mv').value==='g'?[0,1,0]:nrm([cam.fw[0],0,cam.fw[2]]), dn=dot(d,n);
+  if(Math.abs(dn)<1e-6)return null;
+  const t=dot(sub(pt,cam.E),n)/dn;
+  return t>0?add(cam.E,mul(d,t)):null;
+}
+function twist(f,names,pv,u,k,d){
+  const p=f.p,s=sub(p[k],pv),T=sub(sphereHit(d,pv,len(s),p[k]),pv),pr=v=>sub(v,mul(u,dot(v,u)));
+  const sp=pr(s),tp=pr(T);
+  rotGroup(f,names,pv,u,Math.atan2(dot(u,cross(sp,tp)),dot(sp,tp)));
+}
+
+/* ---------- 绘制 ---------- */
+function seg(a,b){
+  let A=toCam(a),B=toCam(b);const n=1;
+  if(A[2]<n&&B[2]<n)return;
+  if(A[2]<n){const t=(n-A[2])/(B[2]-A[2]);A=[A[0]+t*(B[0]-A[0]),A[1]+t*(B[1]-A[1]),n];}
+  else if(B[2]<n){const t=(n-B[2])/(A[2]-B[2]);B=[B[0]+t*(A[0]-B[0]),B[1]+t*(A[1]-B[1]),n];}
+  ctx.moveTo(cam.cx+cam.f*A[0]/A[2],cam.cy-cam.f*A[1]/A[2]);
+  ctx.lineTo(cam.cx+cam.f*B[0]/B[2],cam.cy-cam.f*B[1]/B[2]);
+}
+function drawGrid(){
+  ctx.strokeStyle='#8884';ctx.lineWidth=1;ctx.beginPath();
+  for(let i=-10;i<=10;i++){seg([i*100,0,-1000],[i*100,0,1000]);seg([-1000,0,i*100],[1000,0,i*100]);}
+  ctx.stroke();
+}
+/* 某方向的消失点：有限则放射线，无限远（平行于画面）则画平行线 */
+function vpLines(dir,color,n){
+  const c=[dot(dir,cam.rt),dot(dir,cam.up),dot(dir,cam.fw)], D=Math.hypot(W,H);
+  ctx.strokeStyle=color;ctx.lineWidth=1;ctx.beginPath();
+  if(Math.abs(c[2])<1e-6){
+    const a=Math.atan2(-c[1],c[0]),dx=Math.cos(a),dy=Math.sin(a);
+    for(let i=0;i<n;i++){const o=(i/(n-1)-.5)*D,mx=W/2-dy*o,my=H/2+dx*o;ctx.moveTo(mx-dx*D,my-dy*D);ctx.lineTo(mx+dx*D,my+dy*D);}
+    return ctx.stroke();
+  }
+  const vx=cam.cx+cam.f*c[0]/c[2],vy=cam.cy-cam.f*c[1]/c[2],inside=vx>=0&&vx<=W&&vy>=0&&vy<=H;
+  let a0,a1;
+  if(inside){a0=0;a1=Math.PI*2*(n-1)/n;}
+  else{
+    const base=Math.atan2(H/2-vy,W/2-vx);let lo=0,hi=0;
+    for(const [x,y] of [[0,0],[W,0],[0,H],[W,H]]){let a=Math.atan2(y-vy,x-vx)-base;a=Math.atan2(Math.sin(a),Math.cos(a));lo=Math.min(lo,a);hi=Math.max(hi,a);}
+    a0=base+lo;a1=base+hi;
+  }
+  const L=Math.hypot(vx-W/2,vy-H/2)+D;
+  for(let i=0;i<n;i++){const a=a0+(a1-a0)*(n>1?i/(n-1):.5);ctx.moveTo(vx,vy);ctx.lineTo(vx+Math.cos(a)*L,vy+Math.sin(a)*L);}
+  ctx.stroke();
+  if(inside){ctx.lineWidth=2;ctx.beginPath();ctx.arc(vx,vy,7,0,7);ctx.stroke();}
+}
+function drawPersp(){
+  const n=+$('n').value;
+  vpLines([1,0,0],'#e5484d77',n);vpLines([0,0,1],'#3e63dd77',n);vpLines([0,1,0],'#30a46c77',n);
+  const h=[cam.fw[0],0,cam.fw[2]];
+  if(len(h)>1e-3){
+    const d=nrm(h),y=cam.cy-cam.f*dot(d,cam.up)/dot(d,cam.fw);
+    ctx.strokeStyle='#888';ctx.lineWidth=2;ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(W,y);ctx.stroke();
+    ctx.fillStyle='#888';ctx.font='12px system-ui,sans-serif';ctx.textAlign='left';ctx.fillText('视平线',6,y-6);
+  }
+}
+function drawFig(f,idx){
+  const pj={};for(const k of NAMES)pj[k]=proj(f.p[k]);
+  ctx.lineCap='round';ctx.lineJoin='round';
+  const g=proj([f.p.pelvis[0],0,f.p.pelvis[2]]);
+  if(g.z>5&&pj.pelvis.z>5){   // 铅垂线 + 落点，方便判断人物站在地面哪里
+    ctx.strokeStyle=f.color;ctx.lineWidth=1;ctx.setLineDash([4,4]);ctx.beginPath();ctx.moveTo(pj.pelvis.x,pj.pelvis.y);ctx.lineTo(g.x,g.y);ctx.stroke();ctx.setLineDash([]);
+    ctx.beginPath();ctx.ellipse(g.x,g.y,10*f.h*cam.f/g.z/60,4*f.h*cam.f/g.z/60,0,0,7);ctx.stroke();
+  }
+  const bs=BONES.map(([a,b])=>({a,b,z:(pj[a].z+pj[b].z)/2})).filter(x=>pj[x.a].z>5&&pj[x.b].z>5).sort((u,v)=>v.z-u.z);
+  ctx.strokeStyle=f.color;
+  for(const {a,b,z} of bs){
+    ctx.lineWidth=Math.min(60,Math.max(2,BW[b]*f.h*cam.f/z));
+    ctx.globalAlpha=/L$/.test(b)?.6:1;
+    ctx.beginPath();ctx.moveTo(pj[a].x,pj[a].y);ctx.lineTo(pj[b].x,pj[b].y);ctx.stroke();
+  }
+  ctx.globalAlpha=1;
+  if(pj.head.z>5){
+    const r=.065*f.h*cam.f/pj.head.z;
+    ctx.lineWidth=2;ctx.fillStyle=f.color+'33';ctx.beginPath();ctx.arc(pj.head.x,pj.head.y,r,0,7);ctx.fill();ctx.stroke();
+    ctx.fillStyle=f.color;ctx.font='bold 14px system-ui,sans-serif';ctx.textAlign='center';ctx.fillText(idx+1,pj.head.x,pj.head.y-r-6);
+  }
+  for(const k of NAMES){
+    if(pj[k].z<=5)continue;
+    const r=Math.max(4,.012*f.h*cam.f/pj[k].z),on=sel.f===idx&&sel.k===k;
+    ctx.fillStyle=k==='pelvis'?f.color:'#fff';ctx.strokeStyle=on?'#000':f.color;ctx.lineWidth=on?3:2;
+    ctx.beginPath();ctx.arc(pj[k].x,pj[k].y,on?r+3:r,0,7);ctx.fill();ctx.stroke();
+  }
+}
+function drawTop(){   // 顶视图：看清每个人在空间里的前后位置和相机视野
+  const S=Math.min(150,W*.4),x0=W-S-8,y0=H-S-8,m=S/2,cs=getComputedStyle(document.body);
+  ctx.save();
+  ctx.fillStyle=cs.getPropertyValue('--bar');ctx.fillRect(x0,y0,S,S);
+  ctx.strokeStyle=cs.getPropertyValue('--bd');ctx.lineWidth=1;ctx.strokeRect(x0,y0,S,S);
+  ctx.beginPath();ctx.rect(x0,y0,S,S);ctx.clip();
+  let ex=300;
+  for(const f of figs.slice(0,count))ex=Math.max(ex,Math.abs(f.p.pelvis[0]),Math.abs(f.p.pelvis[2]));
+  ex=Math.max(ex,Math.abs(cam.E[0]),Math.abs(cam.E[2]));
+  const sc=(m-8)/ex,X=w=>x0+m+w*sc,Z=w=>y0+m+w*sc;
+  const hd=Math.atan2(cam.fw[2],cam.fw[0]),hf=Math.atan(W/2/cam.f);
+  ctx.strokeStyle='#888';ctx.beginPath();
+  for(const s of [-1,1]){ctx.moveTo(X(cam.E[0]),Z(cam.E[2]));ctx.lineTo(X(cam.E[0])+Math.cos(hd+s*hf)*S*2,Z(cam.E[2])+Math.sin(hd+s*hf)*S*2);}
+  ctx.stroke();
+  ctx.fillStyle='#888';ctx.beginPath();ctx.arc(X(cam.E[0]),Z(cam.E[2]),4,0,7);ctx.fill();
+  figs.slice(0,count).forEach(f=>{ctx.fillStyle=f.color;ctx.beginPath();ctx.arc(X(f.p.pelvis[0]),Z(f.p.pelvis[2]),5,0,7);ctx.fill();});
+  ctx.restore();
+}
+function draw(){
+  setCam();
+  ctx.fillStyle=getComputedStyle(document.body).getPropertyValue('--cv');ctx.fillRect(0,0,W,H);
+  if($('grid').checked)drawGrid();
+  if($('show').checked)drawPersp();
+  const order=[...Array(count).keys()].sort((a,b)=>proj(figs[b].p.pelvis).z-proj(figs[a].p.pelvis).z);
+  for(const i of order)drawFig(figs[i],i);
+  if($('top').checked)drawTop();
+}
+
+/* ---------- 交互 ---------- */
+const pos=e=>{const r=cv.getBoundingClientRect();return {x:e.clientX-r.left,y:e.clientY-r.top};};
+cv.addEventListener('pointerdown',e=>{
+  const m=pos(e),R=e.pointerType==='touch'?24:14;let best=null;
+  for(let i=0;i<count;i++)for(const k of NAMES){
+    const q=proj(figs[i].p[k]);if(q.z<5)continue;
+    if(Math.hypot(q.x-m.x,q.y-m.y)<R&&(!best||q.z<best.z))best={f:i,k,z:q.z};
+  }
+  if(!best)return;
+  cv.setPointerCapture(e.pointerId);
+  sel={f:best.f,k:best.k};$('hgt').value=Math.round(figs[best.f].h);
+  const f=figs[best.f];
+  drag={f:best.f,k:best.k,pt:f.p.pelvis.slice(),off:[0,0,0]};
+  if(best.k==='pelvis'){const h=planeT(ray(m.x,m.y),drag.pt);if(h)drag.off=sub(f.p.pelvis,h);}
+  draw();
+});
+cv.addEventListener('pointermove',e=>{
+  if(!drag)return;
+  const m=pos(e),f=figs[drag.f],k=drag.k,p=f.p,d=ray(m.x,m.y);
+  if(k==='pelvis'){
+    const h=planeT(d,drag.pt);if(!h)return;
+    const dl=sub(add(h,drag.off),p.pelvis);for(const q of NAMES)p[q]=add(p[q],dl);
+  }else if(k==='neck'){       // 上半身整体倾斜，脊柱长度不变
+    rotFrom(f,UPPER,p.pelvis,sub(p.neck,p.pelvis),sub(sphereHit(d,p.pelvis,f.len.neck,p.neck),p.pelvis));
+  }else if(k==='shL'||k==='shR'){   // 肩膀：扭转胸腔
+    twist(f,UPPER,p.neck,nrm(sub(p.neck,p.pelvis)),k,d);
+  }else if(k==='hpL'||k==='hpR'){   // 髋：扭转双腿
+    twist(f,LEGS,p.pelvis,[0,1,0],k,d);
+  }else{                            // 四肢和头：绕上一个关节转，长度锁死，子关节整体跟随
+    const T=sphereHit(d,p[PARENT[k]],f.len[k],p[k]),dl=sub(T,p[k]);
+    for(const q of kids(k))p[q]=add(p[q],dl);
+  }
+  draw();
+});
+['pointerup','pointercancel'].forEach(t=>cv.addEventListener(t,()=>drag=null));
+
+$('flip').onclick=()=>{   // 把所选关节翻到同一视线上的另一侧（朝向镜头 ↔ 背向镜头）
+  const f=figs[sel.f],k=sel.k;if(!LIMB.has(k))return;
+  const q=proj(f.p[k]),T=sphereHit(ray(q.x,q.y),f.p[PARENT[k]],f.len[k],f.p[k],true),dl=sub(T,f.p[k]);
+  for(const n of kids(k))f.p[n]=add(f.p[n],dl);
+  draw();
+};
+$('hgt').onchange=()=>{
+  const f=figs[sel.f],k=+$('hgt').value/f.h,o=f.p.pelvis,c=[o[0],0,o[2]];
+  for(const n of NAMES)f.p[n]=add(c,mul(sub(f.p[n],c),k));
+  for(const n in f.len)f.len[n]*=k;
+  f.h*=k;draw();
+};
+$('cnt').onchange=()=>{count=+$('cnt').value;if(sel.f>=count)sel={f:0,k:'pelvis'};draw();};
+const PRE={1:[0,0],2:[35,0],3:[35,28]};
+$('pre').onchange=()=>{const v=PRE[$('pre').value];if(v){$('yaw').value=v[0];$('pit').value=v[1];sync();draw();}};
+function sync(){document.querySelectorAll('input[type=range]').forEach(r=>$('o_'+r.id).textContent=r.value);}
+document.querySelectorAll('input[type=range]').forEach(r=>r.oninput=()=>{if(r.id==='yaw'||r.id==='pit')$('pre').value='';sync();draw();});
+for(const id of ['show','grid','top'])$(id).onchange=draw;
+$('reset').onclick=()=>{initFigs();sel={f:0,k:'pelvis'};draw();};
+
+/* 保存 / 读取 / 导出 */
+const UI=['yaw','pit','dist','foc','ty'];
+const download=(blob,name)=>{const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000);};
+$('save').onclick=()=>download(new Blob([JSON.stringify({count,figs:figs.map(f=>({h:f.h,p:f.p,len:f.len})),ui:Object.fromEntries(UI.map(i=>[i,$(i).value]))})],{type:'application/json'}),'pose.json');
+$('load').onclick=()=>$('file').click();
+$('file').onchange=async e=>{
+  try{
+    const d=JSON.parse(await e.target.files[0].text());
+    d.figs.forEach((s,i)=>{if(figs[i])Object.assign(figs[i],{h:s.h,p:s.p,len:s.len});});
+    for(const i of UI)if(d.ui&&d.ui[i]!=null)$(i).value=d.ui[i];
+    count=d.count||count;$('cnt').value=count;$('pre').value='';sync();draw();
+  }catch(_){alert('无法读取这个文件');}
+  e.target.value='';
+};
+$('png').onclick=()=>cv.toBlob(b=>download(b,'pose-perspective.png'));
+
+function resize(){
+  const d=window.devicePixelRatio||1,first=!W;
+  W=cv.clientWidth;H=cv.clientHeight;
+  if(!W||!H)return;
+  cv.width=W*d;cv.height=H*d;ctx.setTransform(d,0,0,d,0,0);
+  if(first)initFigs();
+  draw();
+}
+if(innerWidth>700)$('bar').open=true;
+sync();
+new ResizeObserver(resize).observe(cv);
+</script>
+</body>
+</html>
