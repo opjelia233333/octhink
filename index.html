@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>绘画辅助 · 人物姿势与透视</title>
+<style>
+:root{--cv:#f4f4f2;--bar:#ffffff;--fg:#222;--bd:#d0d0cc;--ac:#3e63dd;color-scheme:light}
+@media(prefers-color-scheme:dark){:root{--cv:#1c1c1f;--bar:#26262a;--fg:#eee;--bd:#444;--ac:#7c97f5;color-scheme:dark}}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{display:flex;flex-direction:column;background:var(--cv);color:var(--fg);font:14px/1.3 system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;padding:env(safe-area-inset-top,0) env(safe-area-inset-right,0) env(safe-area-inset-bottom,0) env(safe-area-inset-left,0)}
+#bar{display:flex;flex-wrap:wrap;gap:8px 12px;align-items:center;padding:8px 10px;background:var(--bar);border-bottom:1px solid var(--bd)}
+#bar label{display:flex;align-items:center;gap:5px;white-space:nowrap}
+select,button{font:inherit;color:var(--fg);background:var(--cv);border:1px solid var(--bd);border-radius:6px;padding:5px 9px}
+button:active{background:var(--bd)}
+input[type=range]{width:90px}
+#c{flex:1;min-height:0;width:100%;display:block;touch-action:none;cursor:crosshair}
+</style>
+</head>
+<body>
+<div id="bar">
+  <label>人数
+    <select id="cnt"><option>1</option><option>2</option><option selected>3</option><option>4</option></select>
+  </label>
+  <label>透视
+    <select id="mode"><option value="1">一点</option><option value="2" selected>两点</option><option value="3">三点</option></select>
+  </label>
+  <label>线数 <input id="n" type="range" min="6" max="60" value="24"></label>
+  <label><input id="show" type="checkbox" checked>透视线</label>
+  <label><input id="chain" type="checkbox" checked>带动子关节</label>
+  <button id="big">所选人物 +</button>
+  <button id="small">所选人物 −</button>
+  <button id="reset">重置</button>
+  <button id="save">导出PNG</button>
+</div>
+<canvas id="c"></canvas>
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const cv = $('c'), ctx = cv.getContext('2d');
+let W = 0, H = 0, figs = [], count = 3, sel = 0, drag = null, last = null;
+
+/* ---------- 骨架定义（以人物高度 s 为单位，相对骨盆） ---------- */
+const OFF = {
+  pelvis:[0,0], neck:[0,-.35], head:[0,-.44],
+  shL:[-.11,-.32], elL:[-.14,-.12], haL:[-.15,.06],
+  shR:[.11,-.32],  elR:[.14,-.12],  haR:[.15,.06],
+  hpL:[-.06,.02],  knL:[-.07,.26],  ftL:[-.07,.5],
+  hpR:[.06,.02],   knR:[.07,.26],   ftR:[.07,.5]
+};
+const NAMES = Object.keys(OFF);
+const PARENT = {neck:'pelvis',head:'neck',shL:'neck',elL:'shL',haL:'elL',shR:'neck',elR:'shR',haR:'elR',
+                hpL:'pelvis',knL:'hpL',ftL:'knL',hpR:'pelvis',knR:'hpR',ftR:'knR'};
+const BONES = Object.entries(PARENT).filter(([k]) => k !== 'head').map(([k,p]) => [p,k]).concat([['neck','head']]);
+const CH = {};
+for (const k in PARENT) (CH[PARENT[k]] = CH[PARENT[k]] || []).push(k);
+const sub = k => [k].concat((CH[k] || []).flatMap(sub));
+const COLORS = ['#e5484d','#3e63dd','#30a46c','#f5a524'];
+
+function makeFig(x, y, s, color) {
+  const pts = {};
+  for (const k in OFF) pts[k] = {x: x + OFF[k][0]*s, y: y + OFF[k][1]*s};
+  return {pts, s, color};
+}
+function initFigs() {
+  const s = Math.min(H*.42, W*.5, 300);
+  figs = [];
+  for (let i = 0; i < 4; i++) figs.push(makeFig(W*(i+1)/5, H*.55, s*(i%2 ? .9 : 1), COLORS[i]));
+}
+
+/* ---------- 透视状态 ---------- */
+const P = {h: 0, v: [
+  {x:0, c:'#e5484d'},              // 一点透视
+  {x:0, c:'#e5484d'},              // 两点：左
+  {x:0, c:'#3e63dd'},              // 两点：右
+  {x:0, y:0, c:'#30a46c', free:1}  // 三点：垂直消失点
+]};
+function initPersp() {
+  P.h = H*.45;
+  P.v[0].x = W/2; P.v[1].x = W*.1; P.v[2].x = W*.9;
+  P.v[3].x = W/2; P.v[3].y = H*.06;
+}
+const active = () => P.v.filter((_, i) => $('mode').value == 1 ? i == 0 : $('mode').value == 2 ? i == 1 || i == 2 : i > 0);
+
+/* ---------- 绘制 ---------- */
+function drawPersp() {
+  const n = +$('n').value, L = 5000;
+  ctx.lineWidth = 1;
+  for (const v of active()) {
+    if (!v.free) v.y = P.h;
+    ctx.strokeStyle = v.c + '55';
+    ctx.beginPath();
+    for (let i = 0; i < n; i++) {
+      const a = i / n * Math.PI * 2;
+      ctx.moveTo(v.x, v.y);
+      ctx.lineTo(v.x + Math.cos(a)*L, v.y + Math.sin(a)*L);
+    }
+    ctx.stroke();
+  }
+  ctx.strokeStyle = '#888'; ctx.lineWidth = 1.5;
+  ctx.beginPath(); ctx.moveTo(0, P.h); ctx.lineTo(W, P.h); ctx.stroke();
+  ctx.fillStyle = '#888'; ctx.font = '12px system-ui,sans-serif'; ctx.textAlign = 'left';
+  ctx.fillText('地平线', 6, P.h - 6);
+  for (const v of active()) {
+    ctx.fillStyle = v.c; ctx.strokeStyle = v.c; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(v.x, v.y, 8, 0, 7); ctx.fill();
+    ctx.beginPath(); ctx.moveTo(v.x-14, v.y); ctx.lineTo(v.x+14, v.y);
+    ctx.moveTo(v.x, v.y-14); ctx.lineTo(v.x, v.y+14); ctx.stroke();
+  }
+}
+function drawFig(f, idx) {
+  const p = f.pts;
+  ctx.lineCap = ctx.lineJoin = 'round';
+  ctx.lineWidth = Math.max(3, f.s*.018);
+  ctx.strokeStyle = f.color;
+  for (const [a, b] of BONES) {
+    ctx.globalAlpha = (a.endsWith('L') || b.endsWith('L')) ? .55 : 1;   // 左侧稍淡，便于分辨前后
+    ctx.beginPath(); ctx.moveTo(p[a].x, p[a].y); ctx.lineTo(p[b].x, p[b].y); ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+  ctx.beginPath(); ctx.arc(p.head.x, p.head.y, f.s*.06, 0, 7); ctx.stroke();
+  for (const k of NAMES) {
+    const r = k === 'pelvis' ? 8 : 6;
+    ctx.fillStyle = k === 'pelvis' ? f.color : '#fff';
+    ctx.lineWidth = idx === sel ? 3 : 2;
+    ctx.beginPath(); ctx.arc(p[k].x, p[k].y, r, 0, 7); ctx.fill(); ctx.stroke();
+  }
+  ctx.fillStyle = f.color; ctx.font = 'bold 14px system-ui,sans-serif'; ctx.textAlign = 'center';
+  ctx.fillText(idx + 1, p.head.x, p.head.y - f.s*.085);
+}
+function draw() {
+  ctx.fillStyle = getComputedStyle(document.body).getPropertyValue('--cv');
+  ctx.fillRect(0, 0, W, H);
+  if ($('show').checked) drawPersp();
+  for (let i = 0; i < count; i++) drawFig(figs[i], i);
+}
+
+/* ---------- 交互 ---------- */
+const pos = e => { const r = cv.getBoundingClientRect(); return {x: e.clientX - r.left, y: e.clientY - r.top}; };
+cv.addEventListener('pointerdown', e => {
+  const p = pos(e), R = e.pointerType === 'touch' ? 24 : 14;
+  cv.setPointerCapture(e.pointerId); last = p;
+  for (let i = count - 1; i >= 0; i--)
+    for (const k of NAMES) {
+      const q = figs[i].pts[k];
+      if (Math.hypot(q.x - p.x, q.y - p.y) < R) { drag = {t:'j', f:i, k}; sel = i; return draw(); }
+    }
+  if ($('show').checked) {
+    for (const v of active()) if (Math.hypot(v.x - p.x, v.y - p.y) < R + 6) { drag = {t:'v', v}; return; }
+    if (Math.abs(p.y - P.h) < 12) drag = {t:'h'};
+  }
+});
+cv.addEventListener('pointermove', e => {
+  if (!drag) return;
+  const p = pos(e), dx = p.x - last.x, dy = p.y - last.y; last = p;
+  if (drag.t === 'j') {
+    const f = figs[drag.f];
+    for (const k of ($('chain').checked ? sub(drag.k) : [drag.k])) { f.pts[k].x += dx; f.pts[k].y += dy; }
+  } else if (drag.t === 'v') {
+    drag.v.x += dx; if (drag.v.free) drag.v.y += dy;
+  } else P.h = Math.max(0, Math.min(H, P.h + dy));
+  draw();
+});
+['pointerup', 'pointercancel'].forEach(t => cv.addEventListener(t, () => drag = null));
+
+function scaleSel(k) {
+  const f = figs[sel], o = f.pts.pelvis, ox = o.x, oy = o.y;
+  for (const n of NAMES) { f.pts[n].x = ox + (f.pts[n].x - ox)*k; f.pts[n].y = oy + (f.pts[n].y - oy)*k; }
+  f.s *= k; draw();
+}
+$('big').onclick = () => scaleSel(1.1);
+$('small').onclick = () => scaleSel(1/1.1);
+$('reset').onclick = () => { initFigs(); initPersp(); draw(); };
+$('cnt').onchange = () => { count = +$('cnt').value; if (sel >= count) sel = 0; draw(); };
+for (const id of ['mode', 'n', 'show']) $(id).addEventListener('input', draw);
+$('save').onclick = () => cv.toBlob(b => {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(b); a.download = 'pose-perspective.png'; a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+});
+
+function resize() {
+  const d = window.devicePixelRatio || 1, first = !W;
+  W = cv.clientWidth; H = cv.clientHeight;
+  cv.width = W*d; cv.height = H*d; ctx.setTransform(d, 0, 0, d, 0, 0);
+  if (first) { initFigs(); initPersp(); }
+  draw();
+}
+window.addEventListener('resize', resize);
+resize();
+</script>
+</body>
+</html>
